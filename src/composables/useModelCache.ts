@@ -1,3 +1,4 @@
+
 import type { CachedModel } from '../type';
 
 const DB_NAME = 'super-resolution-models';
@@ -9,8 +10,6 @@ function openDB(): Promise<IDBDatabase> {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = (e) => {
       const db = (e.target as IDBOpenDBRequest).result;
-      // v1 keyed entries by download url; v2 keys by model id, so the old store
-      // cannot be reused and is dropped (cached bytes are re-downloaded once).
       if (db.objectStoreNames.contains(STORE_NAME)) {
         db.deleteObjectStore(STORE_NAME);
       }
@@ -23,14 +22,8 @@ function openDB(): Promise<IDBDatabase> {
 
 export async function isModelCached(id: string): Promise<boolean> {
   try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.get(id);
-      req.onsuccess = () => resolve(!!req.result);
-      req.onerror = () => resolve(false);
-    });
+    const data = await getCachedModel(id);
+    return data instanceof ArrayBuffer && data.byteLength > 0;
   } catch {
     return false;
   }
@@ -45,7 +38,11 @@ export async function getCachedModel(id: string): Promise<ArrayBuffer | null> {
       const req = store.get(id);
       req.onsuccess = () => {
         const result = req.result as CachedModel | undefined;
-        resolve(result?.data ?? null);
+        resolve(
+          result?.data instanceof ArrayBuffer && result.data.byteLength > 0
+            ? result.data
+            : null,
+        );
       };
       req.onerror = () => resolve(null);
     });
@@ -55,18 +52,22 @@ export async function getCachedModel(id: string): Promise<ArrayBuffer | null> {
 }
 
 export async function cacheModel(id: string, data: ArrayBuffer): Promise<void> {
-  try {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.put({ id, data, cachedAt: Date.now() } satisfies CachedModel);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
-  } catch (err) {
-    console.warn('Failed to cache model:', err);
+  if (!(data instanceof ArrayBuffer) || data.byteLength === 0) {
+    throw new Error('Invalid or empty model data');
   }
+
+  const db = await openDB();
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.put({ id, data, cachedAt: Date.now() } satisfies CachedModel);
+
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error ?? new Error('Failed to cache model'));
+    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
+    tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+  });
 }
 
 export async function deleteCachedModel(id: string): Promise<void> {
@@ -108,7 +109,13 @@ export async function getCacheSize(): Promise<number> {
       const req = store.getAll();
       req.onsuccess = () => {
         const results = req.result as CachedModel[];
-        resolve(results.reduce((sum, item) => sum + item.data.byteLength, 0));
+        resolve(
+          results.reduce(
+            (sum, item) =>
+              sum + (item.data instanceof ArrayBuffer ? item.data.byteLength : 0),
+            0,
+          ),
+        );
       };
       req.onerror = () => resolve(0);
     });

@@ -1,57 +1,37 @@
+
 /// <reference lib="webworker" />
 
 import * as ort from 'onnxruntime-web/wasm';
 import type { ModelLoadStage, WorkerMessage } from '../type';
 import { getMaxSessionThreads } from '../config/concurrency';
 
-// numThreads > 1 deadlocks InferenceSession.create() forever under Electron's
-// app:// (Emscripten pthread pool race, microsoft/onnxruntime#26858): A/B tested
-// 8 threads => stuck, 1 thread => loads. Browsers keep full multithreading.
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';const isElectron = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';
+
+const isElectron =
+  typeof navigator !== 'undefined' &&
+  navigator.userAgent.includes('Electron');
+
 ort.env.wasm.numThreads = isElectron ? 1 : getMaxSessionThreads();
-// Fail wasm backend init instead of hanging forever (0 = no timeout).
 ort.env.wasm.initTimeout = 30_000;
+
 console.log(
   `[worker] init numThreads=${ort.env.wasm.numThreads} electron=${isElectron} isolated=${typeof self !== 'undefined' && self.crossOriginIsolated}`,
 );
 
 // ── Tiling ────────────────────────────────────────────────────────────────────
-// The whole image used to go through a single tensor, which blows past the
-// wasm32 int32 tensor limits (SafeIntOnOverflow in safeint.h) for anything
-// bigger than ~0.5MP and pins the GPU with a huge allocation. We now run the
-// network over overlapping tiles and blend them back, so each inference stays
-// small and safe regardless of input size. Tile edges are kept on a multiple of
-// 64 (the granularity Swin2SR needs) so tiles stay aligned; the overlap is
-// feathered so the seams are invisible. Small networks override the default tile
-// size via their model entry — a larger tile shrinks the re-computed border.
+
 const DEFAULT_TILE_SIZE = 256;
-// Swin2SR only accepts sizes on this granularity; the tile edge must stay a multiple.
 const TILE_SIZE_GRANULARITY = 64;
 const MAX_TILE_SIZE = 1024;
-// 16px of source overlap is enough for the feathered blend to hide seams while
-// roughly halving the re-computed border pixels versus a 32px overlap
-// ((256/240)² ≈ 1.14 vs (256/224)² ≈ 1.31 → ~13% fewer pixels overall).
 const TILE_OVERLAP = 16;
 
-/**
- * Snap a requested tile edge to a size the networks accept. Anything missing or
- * non-finite keeps the default; the result is always a multiple of
- * TILE_SIZE_GRANULARITY and bounded so one tile's buffers cannot exhaust memory.
- */
 function normalizeTileSize(size?: number): number {
   if (size == null || !Number.isFinite(size)) return DEFAULT_TILE_SIZE;
   const snapped = Math.round(size / TILE_SIZE_GRANULARITY) * TILE_SIZE_GRANULARITY;
   return Math.min(MAX_TILE_SIZE, Math.max(TILE_SIZE_GRANULARITY, snapped));
 }
 
-// Rebuild the session on CPU if a single tile's inference does not settle in
-// this window — guards against a dead GPU kernel / lost device that would
-// otherwise leave the promise pending forever.
 const INFER_TIMEOUT_MS = 300_000;
-
-// The stitched native output is one RGBA buffer plus a canvas. Beyond these
-// bounds browsers either refuse the canvas or OOM, so fail with a clear message
-// instead of a cryptic runtime crash.
 const MAX_OUTPUT_DIMENSION = 16_384;
 const MAX_OUTPUT_PIXELS = 200_000_000;
 
@@ -62,67 +42,44 @@ class AbortError extends Error {
   }
 }
 
-/** A backend corruption we cannot recover from in place — the pool rebuilds the worker and retries. */
 const FATAL_PATTERN =
   /memory access out of bounds|cannot enlarge memory|out of memory|allocation failed|RangeError|Aborted|RuntimeError|Assertion failed|OOM/i;
 
 let session: ort.InferenceSession | null = null;
 let currentModelId: string | null = null;
 let currentGpu = false;
-/** Source used to build the current session; kept so we can rebuild it on CPU if GPU inference fails. */
 let currentSource: string | ArrayBuffer | Uint8Array | null = null;
 
-/** Thread count the current session was built with; ORT reads it only at build time. */
 let sessionThreads = isElectron ? 1 : getMaxSessionThreads();
-/** Tile edge used by warm-up and every job until a `load-model` says otherwise. */
 let currentTileSize = DEFAULT_TILE_SIZE;
-/** User's GPU intent, independent of whether the live session actually runs on GPU. */
 let wantsGpu = true;
-/** Channels-last is only a win on some graphs, so the model registry opts in. */
 let gpuPreferredLayout: 'NCHW' | 'NHWC' | undefined;
 let gpuInferTimeoutMs: number | null = null;
-/** A thread/EP change arrived while a session exists; rebuild it at the next task boundary. */
 let sessionStale = false;
 
-/** Set by an `abort` message; checked between tiles so cancellation is prompt. */
 let abortRequested = false;
 
-/**
- * Messages arrive as macrotasks, so an `abort` queued while a tile run blocks
- * this thread is only dispatched after that run returns — yielding once per tile
- * lets it land before the next tile starts instead of a tile later.
- */
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** Id of the job in flight, echoed in every reply so stale results can be dropped. */
 let currentJobId: number | null = null;
-
-/** Serialises inference so a replacement job never runs while the cancelled one unwinds. */
 let jobChain: Promise<void> = Promise.resolve();
 
-/** ORT WASM binary shared by the pool (fetched once) instead of one fetch per worker. */
 let providedWasmBuffer: SharedArrayBuffer | null = null;
 let wasmBinaryApplied = false;
-/** Model bytes shared by the pool, keyed by model id — a view over the pool's SAB, not a copy. */
 const providedModelBuffers = new Map<string, Uint8Array>();
 
 type GpuDeviceLike = { lost: Promise<{ reason?: string }> };
 type GpuAdapterLike = { requestDevice(): Promise<GpuDeviceLike> };
-/** Memoised adapter probe; failures are not cached because they can be transient. */
+
 let adapterProbe: Promise<GpuAdapterLike | null> | null = null;
-/** The GPU device handed to ORT; kept so device-loss watching sees the same one. */
 let gpuDevice: GpuDeviceLike | null = null;
 let deviceMonitorStarted = false;
-/** GPU is skipped until reset when an adapter is missing or this model's GPU session failed. */
 let gpuFailed = false;
 let gpuFailedModelId: string | null = null;
 
 const workerScope = self as unknown as { name?: string };
-// ORT derives its wasm thread pool from this same module: each pthread worker
-// re-runs this file and must keep its own internal `onmessage` handshake, so only
-// the pool-facing instance (named anything but `em-pthread…`) installs the router.
 const isOrtPthreadWorker = workerScope.name?.startsWith('em-pthread') ?? false;
 
 if (!isOrtPthreadWorker) {
@@ -142,36 +99,50 @@ if (!isOrtPthreadWorker) {
           message.payload.gpuProbeTimeoutMs,
         );
         break;
+
       case 'process': {
         const payload = message.payload;
         jobChain = jobChain.then(() => processImage(payload));
         await jobChain;
         break;
       }
+
       case 'configure-worker':
         configureWorker(message.payload.numThreads, message.payload.gpu);
         break;
+
       case 'abort':
         abortRequested = true;
         break;
+
       case 'provide-wasm':
         providedWasmBuffer = message.payload.buffer;
         applyProvidedWasmBinary();
         break;
+
       case 'provide-model':
-        providedModelBuffers.set(message.payload.modelId, new Uint8Array(message.payload.buffer));
+        providedModelBuffers.set(
+          message.payload.modelId,
+          new Uint8Array(message.payload.buffer),
+        );
+        console.log(
+          `[worker] received model buffer: ${message.payload.modelId}, bytes=${message.payload.buffer.byteLength}`,
+        );
         break;
     }
   };
 }
 
-/** Copy the pool-shared WASM bytes into the regular ArrayBuffer ORT needs at compile time. */
 function applyProvidedWasmBinary() {
   if (wasmBinaryApplied || !providedWasmBuffer) return;
+
   wasmBinaryApplied = true;
+
   const bytes = new Uint8Array(providedWasmBuffer.byteLength);
   bytes.set(new Uint8Array(providedWasmBuffer));
-  (ort.env.wasm as unknown as { wasmBinary?: ArrayBuffer }).wasmBinary = bytes.buffer;
+
+  (ort.env.wasm as unknown as { wasmBinary?: ArrayBuffer }).wasmBinary =
+    bytes.buffer;
 }
 
 function resetAdapterProbe() {
@@ -181,6 +152,7 @@ function resetAdapterProbe() {
 
 async function probeWebGpuAdapter(): Promise<GpuAdapterLike | null> {
   if (adapterProbe) return adapterProbe;
+
   adapterProbe = (async () => {
     try {
       const gpu = (
@@ -192,40 +164,55 @@ async function probeWebGpuAdapter(): Promise<GpuAdapterLike | null> {
           };
         }
       ).gpu;
+
       if (!gpu) return null;
-      // ORT picks its own adapter, so this env flag — not an injected device — is
-      // the only way to keep it off the low-power GPU.
+
       (
-        ort.env.webgpu as unknown as { powerPreference?: 'low-power' | 'high-performance' }
+        ort.env.webgpu as unknown as {
+          powerPreference?: 'low-power' | 'high-performance';
+        }
       ).powerPreference = 'high-performance';
-      const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+
+      const adapter = await gpu.requestAdapter({
+        powerPreference: 'high-performance',
+      });
+
       if (!adapter) {
         adapterProbe = null;
         return null;
       }
+
       if (!gpuDevice) {
         gpuDevice = await adapter.requestDevice();
       }
+
       return adapter;
     } catch {
       adapterProbe = null;
       return null;
     }
   })();
+
   return adapterProbe;
 }
 
-/** Degrade to WASM the moment the GPU device is lost, so the pool leaves GPU mode. */
 function watchGpuDeviceLoss(adapter: GpuAdapterLike) {
   if (deviceMonitorStarted) return;
+
   deviceMonitorStarted = true;
-  const devicePromise = gpuDevice ? Promise.resolve(gpuDevice) : adapter.requestDevice();
+
+  const devicePromise = gpuDevice
+    ? Promise.resolve(gpuDevice)
+    : adapter.requestDevice();
+
   devicePromise
     .then((device) =>
       device.lost.then((info) => {
         deviceMonitorStarted = false;
         gpuDevice = null;
+
         if (gpuFailed) return;
+
         gpuFailed = true;
         postGpuStatus(false, `GPU device lost: ${info.reason ?? 'unknown'}`);
         void releaseSession();
@@ -237,17 +224,26 @@ function watchGpuDeviceLoss(adapter: GpuAdapterLike) {
 }
 
 function postGpuStatus(active: boolean, reason?: string) {
-  if (!active && reason) console.warn(`[worker] gpu inactive: ${reason}`);
-  self.postMessage({ type: 'gpu-status', payload: { active, reason } });
+  if (!active && reason) {
+    console.warn(`[worker] gpu inactive: ${reason}`);
+  }
+
+  self.postMessage({
+    type: 'gpu-status',
+    payload: { active, reason },
+  });
 }
 
 async function releaseSession() {
   const previous = session;
+
   session = null;
   currentModelId = null;
   currentSource = null;
   currentGpu = false;
+
   if (!previous) return;
+
   try {
     await previous.release();
   } catch {
@@ -255,38 +251,40 @@ async function releaseSession() {
   }
 }
 
-/**
- * Apply a new thread budget and/or GPU intent. ORT bakes `numThreads` into a
- * session at creation, so a change only takes effect after a rebuild; we flag
- * the live session stale and rebuild from the cached source at the next task
- * boundary instead of re-transferring the model just to change the thread count.
- */
 function configureWorker(numThreads: number, gpu?: boolean) {
   if (gpu !== undefined && gpu !== wantsGpu) {
     wantsGpu = gpu;
-    // Re-enabling GPU is an explicit user intent: give the adapter another chance.
+
     if (gpu) {
       gpuFailed = false;
       gpuFailedModelId = null;
       resetAdapterProbe();
     }
+
     if (session) sessionStale = true;
   }
-  const clamped = Math.max(1, Math.min(getMaxSessionThreads(), Math.floor(numThreads)));
+
+  const clamped = Math.max(
+    1,
+    Math.min(getMaxSessionThreads(), Math.floor(numThreads)),
+  );
+
   if (clamped === sessionThreads) return;
+
   sessionThreads = clamped;
-  if (!isElectron) ort.env.wasm.numThreads = clamped;
+
+  if (!isElectron) {
+    ort.env.wasm.numThreads = clamped;
+  }
+
   if (session) sessionStale = true;
 }
 
-/**
- * Rebuild the live session from the cached source so a pending thread change
- * lands. Build the replacement before releasing the old one: a failed rebuild
- * keeps the current backend alive, and `sessionStale` stays set to retry.
- */
 async function applyPendingThreadChange() {
   if (!sessionStale) return;
+
   const source = currentSource;
+
   if (!session || !source) {
     sessionStale = false;
     return;
@@ -294,6 +292,7 @@ async function applyPendingThreadChange() {
 
   const previous = session;
   const wantGpu = currentGpu && wantsGpu;
+
   let rebuilt: Awaited<ReturnType<typeof createSession>> | null = null;
   let rebuiltGpu = false;
 
@@ -305,6 +304,7 @@ async function applyPendingThreadChange() {
       rebuilt = null;
     }
   }
+
   if (!rebuilt) {
     try {
       rebuilt = await createSession(source, false);
@@ -314,15 +314,16 @@ async function applyPendingThreadChange() {
     }
   }
 
-  // Rebuild failed: keep serving from the current session and retry next task.
   if (!rebuilt) return;
 
   sessionStale = false;
+
   try {
     await previous.release();
   } catch {
     /* session already gone */
   }
+
   session = rebuilt;
   currentGpu = rebuiltGpu;
 }
@@ -339,13 +340,17 @@ function postProgress(
   });
 }
 
-async function createSession(source: string | ArrayBuffer | Uint8Array, gpu: boolean) {
+async function createSession(
+  source: string | ArrayBuffer | Uint8Array,
+  gpu: boolean,
+) {
   const executionProviders: ort.InferenceSession.SessionOptions['executionProviders'] =
     gpu && gpuPreferredLayout
       ? [{ name: 'webgpu', preferredLayout: gpuPreferredLayout }]
       : gpu
         ? ['webgpu']
         : ['wasm'];
+
   const options: ort.InferenceSession.SessionOptions = {
     executionProviders,
     graphOptimizationLevel: 'all',
@@ -355,24 +360,23 @@ async function createSession(source: string | ArrayBuffer | Uint8Array, gpu: boo
   if (typeof source === 'string') {
     return ort.InferenceSession.create(source, options);
   }
-  // Pass a shared-backed view straight through: only a raw ArrayBuffer needs wrapping.
-  const model = source instanceof Uint8Array ? source : new Uint8Array(source);
+
+  const model =
+    source instanceof Uint8Array ? source : new Uint8Array(source);
+
   return ort.InferenceSession.create(model, options);
 }
 
-/**
- * A freshly created session has not compiled its kernels or materialised its
- * memory arenas yet, so its first run pays that cost on top of a real tile.
- * Burning one dummy tile while the pool is still idle makes the first real tile
- * run at steady-state speed.
- */
-async function warmupSession(target: Awaited<ReturnType<typeof createSession>>, tileSize: number) {
-  const input = new ort.Tensor('float32', new Float32Array(3 * tileSize * tileSize), [
-    1,
-    3,
-    tileSize,
-    tileSize,
-  ]);
+async function warmupSession(
+  target: Awaited<ReturnType<typeof createSession>>,
+  tileSize: number,
+) {
+  const input = new ort.Tensor(
+    'float32',
+    new Float32Array(3 * tileSize * tileSize),
+    [1, 3, tileSize, tileSize],
+  );
+
   await target.run({ [target.inputNames[0]]: input });
 }
 
@@ -387,30 +391,32 @@ async function loadModel(
   gpuProbeTimeoutMs?: number,
 ) {
   try {
-    // Each worker in the pool gets its slice of the CPU so N concurrent
-    // workers do not each grab every core and oversubscribe the machine.
-    if (numThreads != null) configureWorker(numThreads, gpu);
+    if (numThreads != null) {
+      configureWorker(numThreads, gpu);
+    }
+
     wantsGpu = gpu;
     gpuPreferredLayout = preferredLayout;
     gpuInferTimeoutMs = gpuProbeTimeoutMs ?? null;
-    // A compiled session is bound to one input shape, so a tile-size change must
-    // rebuild instead of reusing a session sized for the old tile.
-    const desiredTileSize = tileSize != null ? normalizeTileSize(tileSize) : currentTileSize;
+
+    const desiredTileSize =
+      tileSize != null ? normalizeTileSize(tileSize) : currentTileSize;
 
     if (sessionStale) {
       sessionStale = false;
+
       if (session) {
         try {
           await session.release();
         } catch {
           /* session already gone */
         }
+
         session = null;
         currentModelId = null;
       }
     }
 
-    // A different model gets a fresh GPU verdict; only this model's failure sticks.
     if (gpuFailedModelId && gpuFailedModelId !== modelId) {
       gpuFailed = false;
       gpuFailedModelId = null;
@@ -422,7 +428,11 @@ async function loadModel(
       currentGpu === gpu &&
       currentTileSize === desiredTileSize
     ) {
-      self.postMessage({ type: 'model-loaded', payload: { modelId, gpu } });
+      self.postMessage({
+        type: 'model-loaded',
+        payload: { modelId, gpu },
+      });
+
       return;
     }
 
@@ -430,18 +440,29 @@ async function loadModel(
 
     postProgress(0, 'Loading model...', undefined, 'session');
 
-    const source = providedModelBuffers.get(modelId) ?? modelData;
-    if (!source) throw new Error('No model data available');
+    const sharedModel = providedModelBuffers.get(modelId);
+    const source = sharedModel ?? modelData;
 
-    // Honour the GPU intent only when a WebGPU adapter is present and this model
-    // has not already failed on it; otherwise build straight on WASM.
+    console.log(
+      `[worker] load-model id=${modelId} shared=${!!sharedModel} modelData=${!!modelData} bytes=${source?.byteLength ?? 0}`,
+    );
+
+    if (!source || source.byteLength === 0) {
+      throw new Error(
+        `No model data available. modelId=${modelId}, shared=${!!sharedModel}, modelData=${!!modelData}, bytes=${source?.byteLength ?? 0}`,
+      );
+    }
+
     let effectiveGpu = gpu;
+
     if (effectiveGpu) {
       const adapter = await probeWebGpuAdapter();
+
       if (!adapter || gpuFailed) {
         effectiveGpu = false;
         gpuFailed = true;
         gpuFailedModelId = modelId;
+
         postGpuStatus(
           false,
           adapter
@@ -456,18 +477,27 @@ async function loadModel(
     applyProvidedWasmBinary();
 
     const t0 = performance.now();
-    console.log(`[worker] createSession start gpu=${effectiveGpu} bytes=${source.byteLength}`);
+
+    console.log(
+      `[worker] createSession start gpu=${effectiveGpu} bytes=${source.byteLength}`,
+    );
 
     try {
       session = await createSession(source, effectiveGpu);
     } catch (gpuError) {
-      console.warn(`[worker] gpu session failed (${(performance.now() - t0) | 0}ms): ${gpuError}`);
+      console.warn(
+        `[worker] gpu session failed (${(performance.now() - t0) | 0}ms): ${gpuError}`,
+      );
+
       if (!effectiveGpu) throw gpuError;
+
       postProgress(0, 'Loading model...', undefined, 'fallback');
+
       session = await createSession(source, false);
       effectiveGpu = false;
       gpuFailed = true;
       gpuFailedModelId = modelId;
+
       postGpuStatus(false, String(gpuError));
     }
 
@@ -486,24 +516,35 @@ async function loadModel(
     console.log(
       `[worker] model loaded in ${(performance.now() - t0).toFixed(0)}ms gpu=${effectiveGpu}`,
     );
+
     self.postMessage({
       type: 'model-loaded',
       payload: { modelId, gpu: effectiveGpu },
     });
   } catch (error) {
-    console.error(`[worker] model load failed: ${error}`);
+    const errorDetails =
+      error instanceof Error
+        ? `${error.name}: ${error.message}${error.stack ? `\n\nStack:\n${error.stack}` : ''}`
+        : String(error);
+
+    console.error('[worker] model load failed:', errorDetails);
+
     self.postMessage({
       type: 'error',
       payload: {
-        message: `Failed to load model: ${error}`,
-        fatal: FATAL_PATTERN.test(String(error)),
+        message: `Failed to load model:\n${errorDetails}`,
+        fatal: FATAL_PATTERN.test(errorDetails),
       },
     });
   }
 }
 
 function assertOutputSize(w: number, h: number) {
-  if (w > MAX_OUTPUT_DIMENSION || h > MAX_OUTPUT_DIMENSION || w * h > MAX_OUTPUT_PIXELS) {
+  if (
+    w > MAX_OUTPUT_DIMENSION ||
+    h > MAX_OUTPUT_DIMENSION ||
+    w * h > MAX_OUTPUT_PIXELS
+  ) {
     throw new Error(
       `Image too large: output would be ${w}×${h}px, exceeding the ` +
         `${MAX_OUTPUT_DIMENSION}px / ${Math.round(MAX_OUTPUT_PIXELS / 1_000_000)}MP limit`,
@@ -522,12 +563,12 @@ async function processImage(payload: {
 }) {
   const { imageData, width, height, scale } = payload;
   const targetScale = payload.targetScale ?? scale;
-  // Tracks the run in flight so an early exit (abort or a throwing tile) can
-  // neutralise its rejection instead of leaving an unhandled promise behind.
+
   let pending: Promise<Float32Array> | undefined;
 
   try {
     await applyPendingThreadChange();
+
     if (!session) {
       throw new Error('Model not loaded');
     }
@@ -535,23 +576,25 @@ async function processImage(payload: {
     currentJobId = payload.jobId;
     abortRequested = false;
 
-    // When the requested output is smaller than the model's native scale, shrink
-    // each tile right after inference and blend in that smaller space instead of
-    // stitching a full native-size image and resampling it at the very end. The
-    // stitched buffer shrinks by (scale / targetScale)² — e.g. 4× for 4x→2x.
     const rawFactor = scale / targetScale;
     const downsample = targetScale < scale && Number.isInteger(rawFactor);
     const blendScale = downsample ? targetScale : scale;
+
     const blendW = width * blendScale;
     const blendH = height * blendScale;
     const outW = width * targetScale;
     const outH = height * targetScale;
+
     assertOutputSize(blendW, blendH);
-    if (outW !== blendW || outH !== blendH) assertOutputSize(outW, outH);
+
+    if (outW !== blendW || outH !== blendH) {
+      assertOutputSize(outW, outH);
+    }
 
     postProgress(5, 'Preprocessing...');
 
     const outData = new Uint8ClampedArray(blendW * blendH * 4);
+
     const alphaPlane = payload.alpha
       ? scaleAlpha(payload.alpha, width, height, blendW, blendH)
       : null;
@@ -565,46 +608,58 @@ async function processImage(payload: {
     const tilesX = Math.max(1, Math.ceil((width - TILE_OVERLAP) / tileStep));
     const tilesY = Math.max(1, Math.ceil((height - TILE_OVERLAP) / tileStep));
 
-    // Row-major tile order. The feathered blend is order-dependent (earlier tiles
-    // carry full weight, later ones ramp in), so this list is the single source of
-    // ordering for both inference and blending.
     const tiles: Array<{ x0: number; y0: number; tx: number; ty: number }> = [];
+
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
         tiles.push({ x0: tx * tileStep, y0: ty * tileStep, tx, ty });
       }
     }
+
     const totalTiles = tiles.length;
 
-    // Two input buffers: the pixel packing for the next tile runs while the GPU is
-    // still busy with the current one, instead of the CPU idling between runs.
-    // onnxruntime-web forbids concurrent run() on a single session (the run stack
-    // is not re-entrant), so exactly one run is ever in flight.
     const buffers = [
       new Float32Array(3 * tileSize * tileSize),
       new Float32Array(3 * tileSize * tileSize),
     ];
-    // Per-axis blend weights: tile 0 is full-weight, later tiles ramp in. Built
-    // once per job and shared by every tile instead of reallocated per tile.
+
     const weights = buildBlendWeights(blendScale, tileSize);
 
     let done = 0;
     let inferMs = 0;
     let cpuMs = 0;
 
-    /** Queue tile `index`, optionally reusing a buffer already packed by the caller. */
-    const startTile = (index: number, alreadyPacked = false): Promise<Float32Array> => {
+    const startTile = (
+      index: number,
+      alreadyPacked = false,
+    ): Promise<Float32Array> => {
       const buffer = buffers[index % 2];
       const { x0, y0 } = tiles[index];
-      const refill = () => extractTile(imageData, x0, y0, buffer, tileSize);
+
+      const refill = () =>
+        extractTile(imageData, x0, y0, buffer, tileSize);
+
       if (!alreadyPacked) refill();
-      const tensor = new ort.Tensor('float32', buffer, [1, 3, tileSize, tileSize]);
-      return runWithFallback(inputName, outputName, tensor, refill, (ms) => {
-        inferMs += ms;
-      });
+
+      const tensor = new ort.Tensor(
+        'float32',
+        buffer,
+        [1, 3, tileSize, tileSize],
+      );
+
+      return runWithFallback(
+        inputName,
+        outputName,
+        tensor,
+        refill,
+        (ms) => {
+          inferMs += ms;
+        },
+      );
     };
 
     const jobStart = performance.now();
+
     pending = startTile(0);
 
     for (let i = 0; i < totalTiles; i++) {
@@ -617,19 +672,32 @@ async function processImage(payload: {
       );
 
       const packStart = performance.now();
+
       if (i + 1 < totalTiles) {
-        // Packed one run ahead so this CPU work hides behind the in-flight GPU pass.
-        extractTile(imageData, tiles[i + 1].x0, tiles[i + 1].y0, buffers[(i + 1) % 2], tileSize);
+        extractTile(
+          imageData,
+          tiles[i + 1].x0,
+          tiles[i + 1].y0,
+          buffers[(i + 1) % 2],
+          tileSize,
+        );
       }
+
       cpuMs += performance.now() - packStart;
 
       const tileOut = await pending;
+
       if (abortRequested) throw new AbortError();
 
       const blendStart = performance.now();
-      const tileData = downsample ? downsampleTile(tileOut, tileSize * scale, rawFactor) : tileOut;
+
+      const tileData = downsample
+        ? downsampleTile(tileOut, tileSize * scale, rawFactor)
+        : tileOut;
+
       const ax = tx === 0 ? weights.full : weights.ramp;
       const ay = ty === 0 ? weights.full : weights.ramp;
+
       blendTile(
         outData,
         tileData,
@@ -643,13 +711,15 @@ async function processImage(payload: {
         alphaPlane,
         tileSize,
       );
-      cpuMs += performance.now() - blendStart;
 
+      cpuMs += performance.now() - blendStart;
       done++;
 
       if (i + 1 < totalTiles) {
         await yieldToEventLoop();
+
         if (abortRequested) throw new AbortError();
+
         pending = startTile(i + 1, true);
       }
     }
@@ -664,15 +734,20 @@ async function processImage(payload: {
     postProgress(85, 'Postprocessing...');
 
     const stitchedImageData = new ImageData(outData, blendW, blendH);
-    let resultCanvas: OffscreenCanvas | HTMLCanvasElement = new OffscreenCanvas(blendW, blendH);
+
+    let resultCanvas: OffscreenCanvas | HTMLCanvasElement =
+      new OffscreenCanvas(blendW, blendH);
+
     resultCanvas.getContext('2d')!.putImageData(stitchedImageData, 0, 0);
 
     if (outW !== blendW || outH !== blendH) {
       const scaledCanvas = new OffscreenCanvas(outW, outH);
       const scaledCtx = scaledCanvas.getContext('2d')!;
+
       scaledCtx.imageSmoothingEnabled = true;
       scaledCtx.imageSmoothingQuality = 'high';
       scaledCtx.drawImage(resultCanvas, 0, 0, outW, outH);
+
       resultCanvas = scaledCanvas;
     }
 
@@ -691,10 +766,14 @@ async function processImage(payload: {
     });
   } catch (error) {
     pending?.catch(() => undefined);
+
     if (error instanceof AbortError) {
       self.postMessage({
         type: 'aborted',
-        payload: { message: 'Processing cancelled', jobId: currentJobId },
+        payload: {
+          message: 'Processing cancelled',
+          jobId: currentJobId,
+        },
       });
     } else {
       self.postMessage({
@@ -711,12 +790,16 @@ async function processImage(payload: {
   }
 }
 
-/** Reject if `promise` does not settle within `ms` (used to fence dead GPU runs). */
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
     }, ms);
+
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -730,11 +813,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-/**
- * Run one tile. If the active session is on GPU and the run throws or fails to
- * settle (lost device / stuck kernel), rebuild the session on WASM and retry the
- * same tile once before surfacing a hard error.
- */
 async function runWithFallback(
   inputName: string,
   outputName: string,
@@ -747,12 +825,16 @@ async function runWithFallback(
     return results[outputName].data as Float32Array;
   } catch (error) {
     if (abortRequested) throw new AbortError();
+
     if (!currentGpu || !currentSource) throw error;
 
     self.postMessage({
       type: 'gpu-fallback',
-      payload: { message: `GPU inference failed, falling back to CPU: ${error}` },
+      payload: {
+        message: `GPU inference failed, falling back to CPU: ${error}`,
+      },
     });
+
     postProgress(10, 'GPU failed, retrying on CPU...');
 
     session = await createSession(currentSource, false);
@@ -760,24 +842,36 @@ async function runWithFallback(
     gpuFailed = true;
     gpuFailedModelId = currentModelId;
 
-    // The aborted GPU run may have partially written to the shared buffer.
     refill();
+
     const retry = await timedRun(inputName, tensor, onRun);
+
     return retry[outputName].data as Float32Array;
   }
 }
 
-async function timedRun(inputName: string, tensor: ort.Tensor, onRun?: (ms: number) => void) {
+async function timedRun(
+  inputName: string,
+  tensor: ort.Tensor,
+  onRun?: (ms: number) => void,
+) {
   const start = performance.now();
-  const timeoutMs = currentGpu ? (gpuInferTimeoutMs ?? INFER_TIMEOUT_MS) : INFER_TIMEOUT_MS;
+
+  const timeoutMs = currentGpu
+    ? (gpuInferTimeoutMs ?? INFER_TIMEOUT_MS)
+    : INFER_TIMEOUT_MS;
+
   try {
-    return await withTimeout(session!.run({ [inputName]: tensor }), timeoutMs, 'Inference');
+    return await withTimeout(
+      session!.run({ [inputName]: tensor }),
+      timeoutMs,
+      'Inference',
+    );
   } finally {
     onRun?.(performance.now() - start);
   }
 }
 
-/** Copy the tileSize² window at (x0, y0) into `out`, replicating edge pixels. */
 function extractTile(
   imageData: ImageData,
   x0: number,
@@ -789,18 +883,19 @@ function extractTile(
   const plane = tileSize * tileSize;
   const inv = 1 / 255;
 
-  // Interior tiles never read outside the image, so skip the per-pixel clamp.
   if (x0 + tileSize <= width && y0 + tileSize <= height) {
     for (let ly = 0; ly < tileSize; ly++) {
       let si = ((y0 + ly) * width + x0) * 4;
       let di = ly * tileSize;
       const diEnd = di + tileSize;
+
       for (; di < diEnd; di++, si += 4) {
         out[di] = data[si] * inv;
         out[plane + di] = data[si + 1] * inv;
         out[2 * plane + di] = data[si + 2] * inv;
       }
     }
+
     return;
   }
 
@@ -808,10 +903,12 @@ function extractTile(
     const sy = Math.min(height - 1, Math.max(0, y0 + ly));
     const rowBase = sy * width;
     const outRow = ly * tileSize;
+
     for (let lx = 0; lx < tileSize; lx++) {
       const sx = Math.min(width - 1, Math.max(0, x0 + lx));
       const si = (rowBase + sx) * 4;
       const di = outRow + lx;
+
       out[di] = data[si] * inv;
       out[plane + di] = data[si + 1] * inv;
       out[2 * plane + di] = data[si + 2] * inv;
@@ -819,60 +916,63 @@ function extractTile(
   }
 }
 
-/**
- * Precompute the per-axis blend weights once per job. Only two profiles exist:
- * the first tile on an axis contributes fully (`full`), every later tile ramps
- * linearly across the overlap (`ramp`). Both axes share the same profile.
- */
 function buildBlendWeights(blendScale: number, tileSize: number) {
   const ow = tileSize * blendScale;
   const overlap = TILE_OVERLAP * blendScale;
+
   const full = new Float32Array(ow).fill(1);
   const ramp = new Float32Array(ow);
+
   for (let o = 0; o < ow; o++) {
     ramp[o] = Math.min(1, o / overlap);
   }
+
   return { full, ramp };
 }
 
-/** Box-filter one tile's RGB planes from (ow×ow) down to (ow/factor)². */
-function downsampleTile(src: Float32Array, ow: number, factor: number): Float32Array {
+function downsampleTile(
+  src: Float32Array,
+  ow: number,
+  factor: number,
+): Float32Array {
   const owT = ow / factor;
   const planeSrc = ow * ow;
   const planeDst = owT * owT;
+
   const dst = new Float32Array(3 * planeDst);
   const inv = 1 / (factor * factor);
 
   for (let y = 0; y < owT; y++) {
     const sy0 = y * factor;
+
     for (let x = 0; x < owT; x++) {
       const sx0 = x * factor;
+
       let r = 0;
       let g = 0;
       let b = 0;
+
       for (let dy = 0; dy < factor; dy++) {
         let si = (sy0 + dy) * ow + sx0;
+
         for (let dx = 0; dx < factor; dx++, si++) {
           r += src[si];
           g += src[planeSrc + si];
           b += src[2 * planeSrc + si];
         }
       }
+
       const di = y * owT + x;
+
       dst[di] = r * inv;
       dst[planeDst + di] = g * inv;
       dst[2 * planeDst + di] = b * inv;
     }
   }
+
   return dst;
 }
 
-/**
- * Resample the source alpha onto the blend buffer's pixel grid. The mask is
- * painted over white and read back from the alpha channel so the browser
- * interpolates it in premultiplied space; a grayscale RGB image would drag black
- * into every reduced-alpha pixel instead.
- */
 function scaleAlpha(
   alpha: Uint8ClampedArray,
   srcW: number,
@@ -883,6 +983,7 @@ function scaleAlpha(
   if (srcW === dstW && srcH === dstH) return alpha;
 
   const source = new ImageData(srcW, srcH);
+
   for (let i = 0, p = 0; i < alpha.length; i++, p += 4) {
     source.data[p] = 255;
     source.data[p + 1] = 255;
@@ -892,27 +993,24 @@ function scaleAlpha(
 
   const srcCanvas = new OffscreenCanvas(srcW, srcH);
   srcCanvas.getContext('2d')!.putImageData(source, 0, 0);
+
   const dstCanvas = new OffscreenCanvas(dstW, dstH);
   const ctx = dstCanvas.getContext('2d')!;
+
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(srcCanvas, 0, 0, dstW, dstH);
 
   const scaled = ctx.getImageData(0, 0, dstW, dstH).data;
   const out = new Uint8ClampedArray(dstW * dstH);
-  for (let i = 0, p = 3; i < out.length; i++, p += 4) out[i] = scaled[p];
+
+  for (let i = 0, p = 3; i < out.length; i++, p += 4) {
+    out[i] = scaled[p];
+  }
+
   return out;
 }
 
-/**
- * Blend a tile's network output into the final buffer. Where tiles overlap the
- * contribution is feathered back in (linear ramp across TILE_OVERLAP), the first
- * tile along each axis always contributing fully. `ax`/`ay` are the precomputed
- * per-axis weights; `blendScale` maps source pixels to the destination buffer,
- * which is the native scale unless the output was downsampled first. `alphaPlane`
- * carries the source alpha resampled into the same destination space; without it
- * every pixel is written fully opaque.
- */
 function blendTile(
   out: Uint8ClampedArray,
   tile: Float32Array,
@@ -928,36 +1026,48 @@ function blendTile(
 ) {
   const ow = tileSize * blendScale;
   const plane = ow * ow;
+
   const baseX = x0 * blendScale;
   const baseY = y0 * blendScale;
 
   for (let oy = 0; oy < ow; oy++) {
     const gy = baseY + oy;
+
     if (gy >= destH) break;
+
     const aY = ay[oy];
     const tileRow = oy * ow;
+
     for (let ox = 0; ox < ow; ox++) {
       const gx = baseX + ox;
+
       if (gx >= destW) break;
 
       const ti = tileRow + ox;
+
       const r = tile[ti] * 255;
       const g = tile[plane + ti] * 255;
       const b = tile[2 * plane + ti] * 255;
+
       const di = (gy * destW + gx) * 4;
 
       const a = aY * ax[ox];
+
       if (a >= 1) {
         out[di] = r;
         out[di + 1] = g;
         out[di + 2] = b;
       } else {
         const inv = 1 - a;
+
         out[di] = out[di] * inv + r * a;
         out[di + 1] = out[di + 1] * inv + g * a;
         out[di + 2] = out[di + 2] * inv + b * a;
       }
-      out[di + 3] = alphaPlane ? alphaPlane[gy * destW + gx] : 255;
+
+      out[di + 3] = alphaPlane
+        ? alphaPlane[gy * destW + gx]
+        : 255;
     }
   }
 }

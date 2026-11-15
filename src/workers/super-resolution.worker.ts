@@ -7,7 +7,7 @@ import { getMaxSessionThreads } from '../config/concurrency';
 // numThreads > 1 deadlocks InferenceSession.create() forever under Electron's
 // app:// (Emscripten pthread pool race, microsoft/onnxruntime#26858): A/B tested
 // 8 threads => stuck, 1 thread => loads. Browsers keep full multithreading.
-const isElectron = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';const isElectron = typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron');
 ort.env.wasm.numThreads = isElectron ? 1 : getMaxSessionThreads();
 // Fail wasm backend init instead of hanging forever (0 = no timeout).
 ort.env.wasm.initTimeout = 30_000;

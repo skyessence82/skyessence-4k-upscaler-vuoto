@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import * as ort from 'onnxruntime-web';
+import * as ort from 'onnxruntime-web/wasm';
 import type { ModelLoadStage, WorkerMessage } from '../type';
 import { getMaxSessionThreads } from '../config/concurrency';
 
